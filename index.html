@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PatasApp — Manejo e Acompanhamento de Cães</title>
+  <meta name="description" content="Aplicativo para manejo e acompanhamento de cães: cadastro, vacinas, consultas, peso, medicações, passeios e lembretes." />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐾</text></svg>" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand" data-nav="dashboard">
+      <span class="brand-mark">🐾</span>
+      <div>
+        <h1>PatasApp</h1>
+        <small>Manejo e acompanhamento de cães</small>
+      </div>
+    </div>
+    <nav class="main-nav">
+      <button class="nav-btn" data-nav="dashboard">Início</button>
+      <button class="nav-btn" data-nav="dogs">Cães</button>
+      <button class="nav-btn" data-nav="reminders">Lembretes</button>
+    </nav>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <!-- Modal genérico -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h2 id="modal-title">Título</h2>
+        <button class="icon-btn" id="modal-close" aria-label="Fechar">✕</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <footer class="app-footer">
+    <span>PatasApp · Dados salvos localmente no seu navegador</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

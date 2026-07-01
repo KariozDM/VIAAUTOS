@@ -1,0 +1,711 @@
+/* =========================================================
+   PatasApp — Manejo e acompanhamento de cães
+   App de página única, sem dependências. Persiste em localStorage.
+   ========================================================= */
+
+const STORE_KEY = 'patasapp.v1';
+const DOG_EMOJIS = ['🐶', '🐕', '🦮', '🐕‍🦺', '🐩', '🐾'];
+
+/* ---------- Estado ---------- */
+let state = load();
+
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* ignora dados corrompidos */ }
+  return { dogs: [], reminders: [] };
+}
+
+function save() {
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const getDog = (id) => state.dogs.find(d => d.id === id);
+
+/* ---------- Utilitários de data ---------- */
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const [y, m, d] = iso.split('-');
+  return `${d}/${m}/${y}`;
+}
+function today() { return new Date().toISOString().slice(0, 10); }
+function daysBetween(isoA, isoB) {
+  return Math.round((new Date(isoB) - new Date(isoA)) / 86400000);
+}
+function ageFromBirth(iso) {
+  if (!iso) return '—';
+  const b = new Date(iso), n = new Date();
+  let months = (n.getFullYear() - b.getFullYear()) * 12 + (n.getMonth() - b.getMonth());
+  if (n.getDate() < b.getDate()) months--;
+  if (months < 0) return '—';
+  const y = Math.floor(months / 12), m = months % 12;
+  if (y === 0) return `${m} ${m === 1 ? 'mês' : 'meses'}`;
+  if (m === 0) return `${y} ${y === 1 ? 'ano' : 'anos'}`;
+  return `${y}a ${m}m`;
+}
+
+/* ---------- Helpers de UI ---------- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.add('hidden'), 2200);
+}
+
+function openModal(title, bodyHtml) {
+  $('#modal-title').textContent = title;
+  const body = $('#modal-body');
+  delete body.dataset.editId; // evita vazar id entre edição e novo cadastro
+  body.innerHTML = bodyHtml;
+  $('#modal-backdrop').classList.remove('hidden');
+}
+function closeModal() {
+  $('#modal-backdrop').classList.add('hidden');
+  $('#modal-body').innerHTML = '';
+}
+
+/* =========================================================
+   Roteamento simples baseado em hash: #/dashboard, #/dogs,
+   #/dog/<id>, #/reminders
+   ========================================================= */
+function router() {
+  const hash = location.hash.replace(/^#\//, '') || 'dashboard';
+  const [route, param] = hash.split('/');
+  const view = $('#view');
+
+  document.querySelectorAll('.nav-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.nav === route || (route === 'dog' && b.dataset.nav === 'dogs'));
+  });
+
+  if (route === 'dogs') renderDogs(view);
+  else if (route === 'dog') renderDogDetail(view, param);
+  else if (route === 'reminders') renderReminders(view);
+  else renderDashboard(view);
+
+  window.scrollTo(0, 0);
+}
+
+function navigate(hash) { location.hash = hash; }
+
+/* =========================================================
+   Coleta de registros e lembretes
+   ========================================================= */
+const REC_TYPES = {
+  vacina:   { label: 'Vacina',    icon: '💉', fields: ['nome', 'data', 'proxima', 'veterinario'] },
+  consulta: { label: 'Consulta',  icon: '🩺', fields: ['motivo', 'data', 'diagnostico', 'veterinario'] },
+  medicacao:{ label: 'Medicação', icon: '💊', fields: ['nome', 'dose', 'inicio', 'fim'] },
+  peso:     { label: 'Peso',      icon: '⚖️', fields: ['valor', 'data'] },
+  passeio:  { label: 'Passeio',   icon: '🦴', fields: ['data', 'duracao', 'distancia'] },
+};
+
+function ensureArrays(dog) {
+  ['vacinas', 'consultas', 'medicacoes', 'pesos', 'passeios'].forEach(k => {
+    if (!Array.isArray(dog[k])) dog[k] = [];
+  });
+}
+
+/** Retorna todos os lembretes (explícitos + próximas doses de vacina) com status. */
+function collectReminders() {
+  const items = [];
+  state.reminders.forEach(r => items.push({ ...r, source: 'manual', dogId: r.dogId }));
+  state.dogs.forEach(dog => {
+    ensureArrays(dog);
+    dog.vacinas.forEach(v => {
+      if (v.proxima) {
+        items.push({
+          id: 'vac-' + v.id, dogId: dog.id, source: 'vacina',
+          titulo: `Próxima dose: ${v.nome}`, data: v.proxima, tipo: 'Vacina',
+        });
+      }
+    });
+  });
+  const t = today();
+  items.forEach(i => {
+    const diff = daysBetween(t, i.data);
+    i.diff = diff;
+    i.status = diff < 0 ? 'overdue' : diff <= 7 ? 'soon' : 'ok';
+  });
+  items.sort((a, b) => a.data.localeCompare(b.data));
+  return items;
+}
+
+/* =========================================================
+   Dashboard
+   ========================================================= */
+function renderDashboard(view) {
+  const dogs = state.dogs;
+  const reminders = collectReminders();
+  const pending = reminders.filter(r => r.status !== 'ok');
+  const totalVac = dogs.reduce((s, d) => s + (d.vacinas?.length || 0), 0);
+  const totalWalks = dogs.reduce((s, d) => s + (d.passeios?.length || 0), 0);
+
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>Olá! 👋</h2>
+        <p style="color:var(--muted);margin:4px 0 0">Visão geral do cuidado com seus cães.</p>
+      </div>
+      <button class="btn" data-action="add-dog">＋ Novo cão</button>
+    </div>
+
+    <div class="stats">
+      ${statCard('🐕', dogs.length, dogs.length === 1 ? 'Cão cadastrado' : 'Cães cadastrados')}
+      ${statCard('⏰', pending.length, 'Lembretes pendentes')}
+      ${statCard('💉', totalVac, 'Vacinas registradas')}
+      ${statCard('🦴', totalWalks, 'Passeios registrados')}
+    </div>
+
+    ${pending.length ? `
+      <h3 class="section-title">Próximos lembretes</h3>
+      ${pending.slice(0, 5).map(reminderRow).join('')}
+    ` : ''}
+
+    <h3 class="section-title">Meus cães</h3>
+    ${dogs.length ? `<div class="grid">${dogs.map(dogCard).join('')}</div>` : emptyDogs()}
+  `;
+}
+
+function statCard(ic, num, lbl) {
+  return `<div class="stat"><div class="ic">${ic}</div><div class="num">${num}</div><div class="lbl">${esc(lbl)}</div></div>`;
+}
+
+/* =========================================================
+   Lista de cães
+   ========================================================= */
+function renderDogs(view) {
+  view.innerHTML = `
+    <div class="page-head">
+      <h2>Cães</h2>
+      <button class="btn" data-action="add-dog">＋ Novo cão</button>
+    </div>
+    <div class="toolbar">
+      <input class="field search" id="dog-search" type="search" placeholder="Buscar por nome ou raça..." />
+    </div>
+    <div id="dog-grid">${state.dogs.length ? `<div class="grid">${state.dogs.map(dogCard).join('')}</div>` : emptyDogs()}</div>
+  `;
+  const search = $('#dog-search');
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    const list = state.dogs.filter(d =>
+      d.nome.toLowerCase().includes(q) || (d.raca || '').toLowerCase().includes(q));
+    $('#dog-grid').innerHTML = list.length ? `<div class="grid">${list.map(dogCard).join('')}</div>`
+      : `<div class="empty"><div class="big">🔍</div><p>Nenhum cão encontrado.</p></div>`;
+  });
+}
+
+function dogCard(d) {
+  ensureArrays(d);
+  const sexo = d.sexo === 'F' ? 'Fêmea' : d.sexo === 'M' ? 'Macho' : '—';
+  return `
+    <div class="card dog-card" data-nav-dog="${d.id}">
+      <div class="dog-avatar">${d.emoji || '🐶'}</div>
+      <h3>${esc(d.nome)}</h3>
+      <div class="meta">${esc(d.raca || 'Raça não informada')} · ${ageFromBirth(d.nascimento)}</div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <span class="chip sex-${d.sexo || ''}">${sexo}</span>
+        ${d.peso ? `<span class="chip">${esc(d.peso)} kg</span>` : ''}
+        ${d.castrado ? `<span class="chip">Castrado(a)</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function emptyDogs() {
+  return `<div class="empty">
+    <div class="big">🐾</div>
+    <p>Você ainda não cadastrou nenhum cão.</p>
+    <button class="btn" data-action="add-dog">Cadastrar meu primeiro cão</button>
+  </div>`;
+}
+
+/* =========================================================
+   Detalhe do cão + abas
+   ========================================================= */
+function renderDogDetail(view, id) {
+  const d = getDog(id);
+  if (!d) { view.innerHTML = `<div class="empty"><div class="big">🤔</div><p>Cão não encontrado.</p></div>`; return; }
+  ensureArrays(d);
+  const sexo = d.sexo === 'F' ? 'Fêmea' : d.sexo === 'M' ? 'Macho' : '—';
+  const activeTab = renderDogDetail._tab || 'resumo';
+
+  view.innerHTML = `
+    <button class="btn ghost" data-nav="dogs">← Voltar</button>
+    <div class="dog-detail-head" style="margin-top:8px">
+      <div class="dog-avatar">${d.emoji || '🐶'}</div>
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <h2 style="margin:0">${esc(d.nome)}</h2>
+          <span class="chip sex-${d.sexo || ''}">${sexo}</span>
+        </div>
+        <div class="info-line">
+          <span>Raça: <b>${esc(d.raca || '—')}</b></span>
+          <span>Idade: <b>${ageFromBirth(d.nascimento)}</b></span>
+          <span>Peso: <b>${d.peso ? d.peso + ' kg' : '—'}</b></span>
+          <span>Cor: <b>${esc(d.cor || '—')}</b></span>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn secondary small" data-action="edit-dog" data-id="${d.id}">✎ Editar</button>
+        <button class="btn danger small" data-action="delete-dog" data-id="${d.id}">🗑</button>
+      </div>
+    </div>
+
+    <div class="tabs">
+      ${tabBtn('resumo', 'Resumo', activeTab)}
+      ${tabBtn('vacinas', `Vacinas (${d.vacinas.length})`, activeTab)}
+      ${tabBtn('consultas', `Consultas (${d.consultas.length})`, activeTab)}
+      ${tabBtn('medicacoes', `Medicações (${d.medicacoes.length})`, activeTab)}
+      ${tabBtn('pesos', `Peso (${d.pesos.length})`, activeTab)}
+      ${tabBtn('passeios', `Passeios (${d.passeios.length})`, activeTab)}
+    </div>
+    <div id="tab-body">${renderTab(d, activeTab)}</div>
+  `;
+}
+
+function tabBtn(key, label, active) {
+  return `<button class="tab ${active === key ? 'active' : ''}" data-tab="${key}">${label}</button>`;
+}
+
+function renderTab(d, tab) {
+  switch (tab) {
+    case 'vacinas': return listSection(d, 'vacinas', 'vacina');
+    case 'consultas': return listSection(d, 'consultas', 'consulta');
+    case 'medicacoes': return listSection(d, 'medicacoes', 'medicacao');
+    case 'pesos': return weightSection(d);
+    case 'passeios': return listSection(d, 'passeios', 'passeio');
+    default: return summaryTab(d);
+  }
+}
+
+function summaryTab(d) {
+  const lastVac = [...d.vacinas].sort((a, b) => (b.data || '').localeCompare(a.data || ''))[0];
+  const lastVet = [...d.consultas].sort((a, b) => (b.data || '').localeCompare(a.data || ''))[0];
+  const lastWeight = [...d.pesos].sort((a, b) => (b.data || '').localeCompare(a.data || ''))[0];
+  const activeMeds = d.medicacoes.filter(m => !m.fim || m.fim >= today());
+  return `
+    <div class="grid">
+      <div class="card"><h3 style="margin-top:0">💉 Última vacina</h3>
+        ${lastVac ? `<p style="margin:0"><b>${esc(lastVac.nome)}</b><br><span style="color:var(--muted)">${fmtDate(lastVac.data)}</span></p>` : semDados()}</div>
+      <div class="card"><h3 style="margin-top:0">🩺 Última consulta</h3>
+        ${lastVet ? `<p style="margin:0"><b>${esc(lastVet.motivo)}</b><br><span style="color:var(--muted)">${fmtDate(lastVet.data)}</span></p>` : semDados()}</div>
+      <div class="card"><h3 style="margin-top:0">⚖️ Peso atual</h3>
+        ${lastWeight ? `<p style="margin:0"><b>${esc(lastWeight.valor)} kg</b><br><span style="color:var(--muted)">${fmtDate(lastWeight.data)}</span></p>` : semDados()}</div>
+      <div class="card"><h3 style="margin-top:0">💊 Medicações ativas</h3>
+        ${activeMeds.length ? activeMeds.map(m => `<p style="margin:0 0 4px"><b>${esc(m.nome)}</b> <span style="color:var(--muted)">${esc(m.dose || '')}</span></p>`).join('') : semDados()}</div>
+    </div>
+    ${d.microchip || d.notas ? `<div class="card" style="margin-top:16px">
+      ${d.microchip ? `<p style="margin:0 0 6px"><b>Microchip:</b> ${esc(d.microchip)}</p>` : ''}
+      ${d.notas ? `<p style="margin:0"><b>Observações:</b> ${esc(d.notas)}</p>` : ''}
+    </div>` : ''}
+  `;
+}
+const semDados = () => `<p style="margin:0;color:var(--muted)">Sem registros.</p>`;
+
+/** Seção genérica de lista (vacinas, consultas, medicações, passeios). */
+function listSection(d, key, type) {
+  const meta = REC_TYPES[type];
+  const items = [...d[key]].sort((a, b) => (b.data || b.inicio || '').localeCompare(a.data || a.inicio || ''));
+  return `
+    <div class="toolbar">
+      <button class="btn" data-action="add-record" data-id="${d.id}" data-type="${type}">＋ Adicionar ${meta.label.toLowerCase()}</button>
+    </div>
+    ${items.length ? items.map(it => recordRow(d.id, key, type, it)).join('')
+      : `<div class="empty"><div class="big">${meta.icon}</div><p>Nenhuma ${meta.label.toLowerCase()} registrada.</p></div>`}
+  `;
+}
+
+function recordRow(dogId, key, type, it) {
+  const meta = REC_TYPES[type];
+  let title = '', sub = '', date = '';
+  if (type === 'vacina') {
+    title = esc(it.nome); date = fmtDate(it.data);
+    sub = [it.veterinario && `Vet.: ${esc(it.veterinario)}`, it.proxima && `Próxima dose: ${fmtDate(it.proxima)}`].filter(Boolean).join(' · ');
+  } else if (type === 'consulta') {
+    title = esc(it.motivo); date = fmtDate(it.data);
+    sub = [it.diagnostico && esc(it.diagnostico), it.veterinario && `Vet.: ${esc(it.veterinario)}`].filter(Boolean).join(' · ');
+  } else if (type === 'medicacao') {
+    title = esc(it.nome); date = fmtDate(it.inicio);
+    sub = [it.dose && `Dose: ${esc(it.dose)}`, it.fim ? `até ${fmtDate(it.fim)}` : 'em uso'].filter(Boolean).join(' · ');
+  } else if (type === 'passeio') {
+    title = 'Passeio'; date = fmtDate(it.data);
+    sub = [it.duracao && `${esc(it.duracao)} min`, it.distancia && `${esc(it.distancia)} km`].filter(Boolean).join(' · ');
+  }
+  return `
+    <div class="record">
+      <div class="rec-ic">${meta.icon}</div>
+      <div class="rec-body">
+        <div class="rec-title">${title || meta.label}</div>
+        ${sub ? `<div class="rec-sub">${sub}</div>` : ''}
+      </div>
+      <div class="rec-date">${date}</div>
+      <div class="rec-actions">
+        <button class="icon-btn" data-action="edit-record" data-id="${dogId}" data-key="${key}" data-type="${type}" data-rid="${it.id}">✎</button>
+        <button class="icon-btn" data-action="delete-record" data-id="${dogId}" data-key="${key}" data-rid="${it.id}">🗑</button>
+      </div>
+    </div>`;
+}
+
+/** Peso com mini-gráfico. */
+function weightSection(d) {
+  const items = [...d.pesos].sort((a, b) => (a.data || '').localeCompare(b.data || ''));
+  return `
+    <div class="toolbar">
+      <button class="btn" data-action="add-record" data-id="${d.id}" data-type="peso">＋ Registrar peso</button>
+    </div>
+    ${items.length ? weightChart(items) : ''}
+    ${items.length ? [...items].reverse().map(it => `
+      <div class="record">
+        <div class="rec-ic">⚖️</div>
+        <div class="rec-body"><div class="rec-title">${esc(it.valor)} kg</div></div>
+        <div class="rec-date">${fmtDate(it.data)}</div>
+        <div class="rec-actions">
+          <button class="icon-btn" data-action="edit-record" data-id="${d.id}" data-key="pesos" data-type="peso" data-rid="${it.id}">✎</button>
+          <button class="icon-btn" data-action="delete-record" data-id="${d.id}" data-key="pesos" data-rid="${it.id}">🗑</button>
+        </div>
+      </div>`).join('')
+      : `<div class="empty"><div class="big">⚖️</div><p>Nenhum peso registrado ainda.</p></div>`}
+  `;
+}
+
+function weightChart(items) {
+  const vals = items.map(i => parseFloat(i.valor)).filter(v => !isNaN(v));
+  if (vals.length < 2) return '';
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = max - min || 1;
+  const W = 600, H = 160, pad = 24;
+  const step = (W - pad * 2) / (items.length - 1);
+  const pts = items.map((it, i) => {
+    const v = parseFloat(it.valor);
+    const x = pad + i * step;
+    const y = H - pad - ((v - min) / range) * (H - pad * 2);
+    return [x, y];
+  });
+  const path = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+  const dots = pts.map(p => `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="4" fill="var(--primary)"/>`).join('');
+  return `<div class="card" style="margin-bottom:16px">
+    <h3 style="margin:0 0 8px">Evolução do peso</h3>
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
+      <path d="${path}" fill="none" stroke="var(--primary)" stroke-width="2.5"/>
+      ${dots}
+      <text x="${pad}" y="14" font-size="12" fill="var(--muted)">${max} kg</text>
+      <text x="${pad}" y="${H - 4}" font-size="12" fill="var(--muted)">${min} kg</text>
+    </svg>
+  </div>`;
+}
+
+/* =========================================================
+   Lembretes
+   ========================================================= */
+function renderReminders(view) {
+  const items = collectReminders();
+  view.innerHTML = `
+    <div class="page-head">
+      <h2>Lembretes</h2>
+      <button class="btn" data-action="add-reminder">＋ Novo lembrete</button>
+    </div>
+    ${items.length ? items.map(reminderRow).join('')
+      : `<div class="empty"><div class="big">⏰</div><p>Nenhum lembrete. Adicione um ou registre a próxima dose de uma vacina.</p></div>`}
+  `;
+}
+
+function reminderRow(r) {
+  const dog = getDog(r.dogId);
+  const badge = r.status === 'overdue' ? `<span class="badge overdue">Atrasado</span>`
+    : r.status === 'soon' ? `<span class="badge soon">Em breve</span>`
+    : `<span class="badge ok">Agendado</span>`;
+  const when = r.diff === 0 ? 'Hoje' : r.diff < 0 ? `há ${-r.diff} dia(s)` : `em ${r.diff} dia(s)`;
+  return `
+    <div class="record reminder ${r.status}">
+      <div class="rec-ic">${r.source === 'vacina' ? '💉' : '🔔'}</div>
+      <div class="rec-body">
+        <div class="rec-title">${esc(r.titulo)} ${badge}</div>
+        <div class="rec-sub">${dog ? esc(dog.nome) + ' · ' : ''}${esc(r.tipo || 'Lembrete')} · ${when}</div>
+      </div>
+      <div class="rec-date">${fmtDate(r.data)}</div>
+      <div class="rec-actions">
+        ${r.source === 'manual' ? `<button class="icon-btn" data-action="delete-reminder" data-rid="${r.id}">🗑</button>` : ''}
+      </div>
+    </div>`;
+}
+
+/* =========================================================
+   Formulários (cão, registros, lembrete)
+   ========================================================= */
+function dogForm(dog) {
+  const d = dog || { emoji: '🐶', sexo: 'M' };
+  return `
+    <form id="dog-form">
+      <div class="field full">
+        <label>Foto (emoji)</label>
+        <div class="emoji-picker">
+          ${DOG_EMOJIS.map(e => `<button type="button" class="emoji-opt ${e === d.emoji ? 'selected' : ''}" data-emoji="${e}">${e}</button>`).join('')}
+        </div>
+        <input type="hidden" name="emoji" value="${d.emoji || '🐶'}" />
+      </div>
+      <div class="form-grid">
+        <div class="field full"><label>Nome *</label><input name="nome" required value="${esc(d.nome)}" placeholder="Ex.: Rex" /></div>
+        <div class="field"><label>Raça</label><input name="raca" value="${esc(d.raca)}" placeholder="Ex.: Labrador" /></div>
+        <div class="field"><label>Sexo</label>
+          <select name="sexo">
+            <option value="M" ${d.sexo === 'M' ? 'selected' : ''}>Macho</option>
+            <option value="F" ${d.sexo === 'F' ? 'selected' : ''}>Fêmea</option>
+          </select>
+        </div>
+        <div class="field"><label>Data de nascimento</label><input type="date" name="nascimento" value="${esc(d.nascimento)}" max="${today()}" /></div>
+        <div class="field"><label>Peso (kg)</label><input type="number" step="0.1" min="0" name="peso" value="${esc(d.peso)}" placeholder="Ex.: 12.5" /></div>
+        <div class="field"><label>Cor</label><input name="cor" value="${esc(d.cor)}" placeholder="Ex.: Caramelo" /></div>
+        <div class="field"><label>Microchip</label><input name="microchip" value="${esc(d.microchip)}" placeholder="Nº do chip" /></div>
+        <div class="field full" style="flex-direction:row;align-items:center;gap:8px">
+          <input type="checkbox" name="castrado" id="castrado" ${d.castrado ? 'checked' : ''} style="width:auto" />
+          <label for="castrado" style="margin:0">Castrado(a)</label>
+        </div>
+        <div class="field full"><label>Observações</label><textarea name="notas" rows="2" placeholder="Alergias, temperamento, cuidados especiais...">${esc(d.notas)}</textarea></div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn secondary" data-action="close-modal">Cancelar</button>
+        <button type="submit" class="btn">${dog ? 'Salvar' : 'Cadastrar'}</button>
+      </div>
+    </form>`;
+}
+
+function recordForm(type, rec) {
+  const r = rec || {};
+  const f = (name, label, opts = {}) => {
+    const t = opts.type || 'text';
+    const val = esc(r[name] ?? opts.default ?? '');
+    return `<div class="field ${opts.full ? 'full' : ''}"><label>${label}${opts.req ? ' *' : ''}</label>
+      <input type="${t}" name="${name}" ${opts.req ? 'required' : ''} value="${val}" ${opts.step ? `step="${opts.step}"` : ''} ${opts.placeholder ? `placeholder="${opts.placeholder}"` : ''} /></div>`;
+  };
+  let fields = '';
+  if (type === 'vacina') {
+    fields = f('nome', 'Vacina', { full: true, req: true, placeholder: 'Ex.: V10, Antirrábica' })
+      + f('data', 'Data de aplicação', { type: 'date', default: today() })
+      + f('proxima', 'Próxima dose', { type: 'date' })
+      + f('veterinario', 'Veterinário / Clínica', { full: true });
+  } else if (type === 'consulta') {
+    fields = f('motivo', 'Motivo', { full: true, req: true, placeholder: 'Ex.: Check-up anual' })
+      + f('data', 'Data', { type: 'date', default: today() })
+      + f('veterinario', 'Veterinário / Clínica', {})
+      + `<div class="field full"><label>Diagnóstico / Observações</label><textarea name="diagnostico" rows="2">${esc(r.diagnostico)}</textarea></div>`;
+  } else if (type === 'medicacao') {
+    fields = f('nome', 'Medicamento', { full: true, req: true, placeholder: 'Ex.: Vermífugo' })
+      + f('dose', 'Dose / Frequência', { placeholder: 'Ex.: 1 comp. 8/8h' })
+      + f('inicio', 'Início', { type: 'date', default: today() })
+      + f('fim', 'Fim (deixe vazio se em uso)', { type: 'date' });
+  } else if (type === 'peso') {
+    fields = f('valor', 'Peso (kg)', { type: 'number', step: '0.1', req: true, placeholder: 'Ex.: 12.5' })
+      + f('data', 'Data', { type: 'date', default: today() });
+  } else if (type === 'passeio') {
+    fields = f('data', 'Data', { type: 'date', default: today() })
+      + f('duracao', 'Duração (min)', { type: 'number', placeholder: 'Ex.: 30' })
+      + f('distancia', 'Distância (km)', { type: 'number', step: '0.1', placeholder: 'Ex.: 2.5' });
+  }
+  return `<form id="record-form" data-type="${type}">
+    <div class="form-grid">${fields}</div>
+    <div class="form-actions">
+      <button type="button" class="btn secondary" data-action="close-modal">Cancelar</button>
+      <button type="submit" class="btn">Salvar</button>
+    </div>
+  </form>`;
+}
+
+function reminderForm() {
+  const opts = state.dogs.map(d => `<option value="${d.id}">${esc(d.nome)}</option>`).join('');
+  return `<form id="reminder-form">
+    <div class="form-grid">
+      <div class="field full"><label>Título *</label><input name="titulo" required placeholder="Ex.: Banho e tosa" /></div>
+      <div class="field"><label>Cão</label><select name="dogId"><option value="">— Geral —</option>${opts}</select></div>
+      <div class="field"><label>Data *</label><input type="date" name="data" required value="${today()}" /></div>
+      <div class="field full"><label>Tipo</label><input name="tipo" placeholder="Ex.: Higiene, Vermífugo..." /></div>
+    </div>
+    <div class="form-actions">
+      <button type="button" class="btn secondary" data-action="close-modal">Cancelar</button>
+      <button type="submit" class="btn">Salvar</button>
+    </div>
+  </form>`;
+}
+
+function formToObj(form) {
+  const o = {};
+  new FormData(form).forEach((v, k) => { o[k] = typeof v === 'string' ? v.trim() : v; });
+  o.castrado = form.querySelector('[name=castrado]')?.checked || false;
+  return o;
+}
+
+/* =========================================================
+   Ações (delegação de eventos)
+   ========================================================= */
+function handleAction(action, el) {
+  const id = el.dataset.id;
+  switch (action) {
+    case 'add-dog':
+      openModal('Novo cão', dogForm(null));
+      break;
+    case 'edit-dog':
+      openModal('Editar cão', dogForm(getDog(id)));
+      break;
+    case 'delete-dog': {
+      const d = getDog(id);
+      if (d && confirm(`Excluir "${d.nome}" e todos os seus registros?`)) {
+        state.dogs = state.dogs.filter(x => x.id !== id);
+        state.reminders = state.reminders.filter(r => r.dogId !== id);
+        save(); toast('Cão excluído'); navigate('#/dogs');
+      }
+      break;
+    }
+    case 'add-record':
+      openModal(`Adicionar ${REC_TYPES[el.dataset.type].label.toLowerCase()}`, recordForm(el.dataset.type, null));
+      $('#record-form').dataset.dogId = id;
+      break;
+    case 'edit-record': {
+      const d = getDog(id); const rec = d[el.dataset.key].find(r => r.id === el.dataset.rid);
+      openModal(`Editar ${REC_TYPES[el.dataset.type].label.toLowerCase()}`, recordForm(el.dataset.type, rec));
+      const f = $('#record-form'); f.dataset.dogId = id; f.dataset.key = el.dataset.key; f.dataset.rid = el.dataset.rid;
+      break;
+    }
+    case 'delete-record': {
+      const d = getDog(id);
+      d[el.dataset.key] = d[el.dataset.key].filter(r => r.id !== el.dataset.rid);
+      save(); toast('Registro excluído'); router();
+      break;
+    }
+    case 'add-reminder':
+      openModal('Novo lembrete', reminderForm());
+      break;
+    case 'delete-reminder':
+      state.reminders = state.reminders.filter(r => r.id !== el.dataset.rid);
+      save(); toast('Lembrete excluído'); router();
+      break;
+    case 'close-modal':
+      closeModal();
+      break;
+  }
+}
+
+function handleSubmit(form) {
+  if (form.id === 'dog-form') {
+    const o = formToObj(form);
+    if (!o.nome) return;
+    const editingId = $('#modal-body').dataset.editId;
+    const existing = state.dogs.find(d => d.id === editingId);
+    if (existing) {
+      Object.assign(existing, o);
+      toast('Cão atualizado');
+    } else {
+      const dog = { id: uid(), ...o, vacinas: [], consultas: [], medicacoes: [], pesos: [], passeios: [] };
+      state.dogs.push(dog);
+      toast('Cão cadastrado!');
+    }
+    save(); closeModal(); router();
+  } else if (form.id === 'record-form') {
+    const dog = getDog(form.dataset.dogId);
+    const type = form.dataset.type;
+    const key = { vacina: 'vacinas', consulta: 'consultas', medicacao: 'medicacoes', peso: 'pesos', passeio: 'passeios' }[type];
+    const o = formToObj(form);
+    if (form.dataset.rid) {
+      const rec = dog[key].find(r => r.id === form.dataset.rid);
+      Object.assign(rec, o);
+    } else {
+      dog[key].push({ id: uid(), ...o });
+    }
+    // Sincroniza peso atual do cão com o registro mais recente
+    if (type === 'peso') {
+      const latest = [...dog.pesos].sort((a, b) => (b.data || '').localeCompare(a.data || ''))[0];
+      if (latest) dog.peso = latest.valor;
+    }
+    save(); toast('Registro salvo'); closeModal(); router();
+  } else if (form.id === 'reminder-form') {
+    const o = formToObj(form);
+    if (!o.titulo || !o.data) return;
+    state.reminders.push({ id: uid(), ...o });
+    save(); toast('Lembrete criado'); closeModal(); router();
+  }
+}
+
+/* =========================================================
+   Wiring global de eventos
+   ========================================================= */
+document.addEventListener('click', (e) => {
+  const emoji = e.target.closest('.emoji-opt');
+  if (emoji) {
+    emoji.parentElement.querySelectorAll('.emoji-opt').forEach(x => x.classList.remove('selected'));
+    emoji.classList.add('selected');
+    const hidden = emoji.closest('form').querySelector('[name=emoji]');
+    if (hidden) hidden.value = emoji.dataset.emoji;
+    return;
+  }
+  const actionEl = e.target.closest('[data-action]');
+  if (actionEl) {
+    handleAction(actionEl.dataset.action, actionEl);
+    // ao editar cão, guarda id no modal-body
+    if (actionEl.dataset.action === 'edit-dog') $('#modal-body').dataset.editId = actionEl.dataset.id;
+    return;
+  }
+  const navDog = e.target.closest('[data-nav-dog]');
+  if (navDog) { renderDogDetail._tab = 'resumo'; navigate('#/dog/' + navDog.dataset.navDog); return; }
+  const nav = e.target.closest('[data-nav]');
+  if (nav) { navigate('#/' + nav.dataset.nav); return; }
+  const tab = e.target.closest('[data-tab]');
+  if (tab) {
+    renderDogDetail._tab = tab.dataset.tab;
+    tab.parentElement.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const d = getDog(location.hash.split('/')[2]);
+    if (d) $('#tab-body').innerHTML = renderTab(d, tab.dataset.tab);
+    return;
+  }
+  if (e.target.id === 'modal-close' || e.target.id === 'modal-backdrop') closeModal();
+});
+
+document.addEventListener('submit', (e) => {
+  if (e.target.matches('#dog-form, #record-form, #reminder-form')) {
+    e.preventDefault();
+    handleSubmit(e.target);
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
+window.addEventListener('hashchange', router);
+window.addEventListener('DOMContentLoaded', () => {
+  seedIfEmpty();
+  router();
+});
+
+/* =========================================================
+   Dados de exemplo (apenas na primeira visita)
+   ========================================================= */
+function seedIfEmpty() {
+  if (state.dogs.length || localStorage.getItem(STORE_KEY)) return;
+  const demo = {
+    id: uid(), nome: 'Rex', raca: 'Labrador', sexo: 'M',
+    nascimento: '2021-03-15', peso: '28.5', cor: 'Caramelo', emoji: '🦮',
+    castrado: true, microchip: '', notas: 'Adora água e brincar de buscar.',
+    vacinas: [
+      { id: uid(), nome: 'V10 (múltipla)', data: '2025-01-10', proxima: '2026-01-10', veterinario: 'Clínica PetVida' },
+      { id: uid(), nome: 'Antirrábica', data: '2025-01-10', proxima: '2026-01-10', veterinario: 'Clínica PetVida' },
+    ],
+    consultas: [{ id: uid(), motivo: 'Check-up anual', data: '2025-01-10', diagnostico: 'Saudável', veterinario: 'Dra. Ana' }],
+    medicacoes: [{ id: uid(), nome: 'Antipulgas', dose: '1 pipeta/mês', inicio: '2025-06-01', fim: '' }],
+    pesos: [
+      { id: uid(), valor: '26.0', data: '2024-10-01' },
+      { id: uid(), valor: '27.2', data: '2025-01-10' },
+      { id: uid(), valor: '28.5', data: '2025-06-01' },
+    ],
+    passeios: [
+      { id: uid(), data: '2025-06-28', duracao: '40', distancia: '3.2' },
+      { id: uid(), data: '2025-06-29', duracao: '25', distancia: '1.8' },
+    ],
+  };
+  state.dogs.push(demo);
+  save();
+}
